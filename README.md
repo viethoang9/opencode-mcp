@@ -40,6 +40,19 @@ uv run opencode-mcp
 
 Resume after any disconnect: re-call `opencode_events_list` from your stored `next_seq`, then `opencode_events_verify(from_seq, to_seq)`.
 
+## Max effort
+
+`opencode_ask` / `opencode_prompt` / `opencode_prompt_async` take `model`
+(`provider/model`), `agent`, and `variant` (provider-specific reasoning
+effort, forwarded verbatim). Advise agents via repo rules (`AGENTS.md`):
+
+```md
+- Always pass an explicit strong `model` + max `variant` to opencode tools.
+- Long jobs: prompt_async, then poll task_result + events_list from your
+  cursor until the session is idle. Never report done while busy.
+- Check permissions_pending after every poll and reply; then events_verify.
+```
+
 ## Config (env)
 
 | Var | Default | Purpose |

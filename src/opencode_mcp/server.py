@@ -124,6 +124,24 @@ def _model_arg(model: str | None) -> dict[str, str] | None:
     return None
 
 
+def _prompt_body(
+    text: str,
+    model: str | None,
+    agent: str | None,
+    variant: str | None,
+) -> dict[str, Any]:
+    """Build a session.prompt body: text part + optional model/agent/reasoning variant."""
+    body: dict[str, Any] = {"parts": [{"type": "text", "text": text}]}
+    m = _model_arg(model)
+    if m:
+        body["model"] = m
+    if agent:
+        body["agent"] = agent
+    if variant:
+        body["variant"] = variant
+    return body
+
+
 # -- health ---------------------------------------------------------------
 @mcp.tool()
 async def opencode_health() -> dict[str, Any]:
@@ -187,16 +205,16 @@ async def opencode_session_status(session_id: str | None = None) -> dict[str, An
 # -- prompting (sync + async task bridge) -----------------------------------
 @mcp.tool()
 async def opencode_prompt(
-    session_id: str, text: str, model: str | None = None, agent: str | None = None
+    session_id: str,
+    text: str,
+    model: str | None = None,
+    agent: str | None = None,
+    variant: str | None = None,
 ) -> dict[str, Any]:
-    """Send a prompt and WAIT for the reply. For long jobs use opencode_prompt_async instead."""
+    """Send a prompt and WAIT for the reply. Default to max effort (explicit strong
+    model + max variant) unless the user specifies effort. Long jobs: use prompt_async."""
     await STATE.ensure()
-    body: dict[str, Any] = {"parts": [{"type": "text", "text": text}]}
-    m = _model_arg(model)
-    if m:
-        body["model"] = m
-    if agent:
-        body["agent"] = agent
+    body = _prompt_body(text, model, agent, variant)
     msg = await STATE.client.request(
         "POST", "/session/{sessionID}/message", path_params={"sessionID": session_id}, body=body
     )
@@ -211,16 +229,17 @@ async def opencode_prompt(
 
 @mcp.tool()
 async def opencode_prompt_async(
-    session_id: str, text: str, model: str | None = None, agent: str | None = None
+    session_id: str,
+    text: str,
+    model: str | None = None,
+    agent: str | None = None,
+    variant: str | None = None,
 ) -> dict[str, Any]:
-    """Send a prompt WITHOUT waiting. Returns task handle; poll task_status/task_result. Lossless."""
+    """Send a prompt WITHOUT waiting. Default to max effort (explicit strong model +
+    max variant) unless the user specifies effort. Returns task handle; poll task_result
+    + events_list until idle, reply to permissions_pending, finish with events_verify."""
     await STATE.ensure()
-    body: dict[str, Any] = {"parts": [{"type": "text", "text": text}]}
-    m = _model_arg(model)
-    if m:
-        body["model"] = m
-    if agent:
-        body["agent"] = agent
+    body = _prompt_body(text, model, agent, variant)
     await STATE.client.request(
         "POST", "/session/{sessionID}/prompt_async", path_params={"sessionID": session_id}, body=body
     )
@@ -260,18 +279,18 @@ async def opencode_task_cancel(session_id: str) -> dict[str, Any]:
 
 @mcp.tool()
 async def opencode_ask(
-    text: str, title: str | None = None, model: str | None = None, agent: str | None = None
+    text: str,
+    title: str | None = None,
+    model: str | None = None,
+    agent: str | None = None,
+    variant: str | None = None,
 ) -> dict[str, Any]:
-    """One-shot: create a session and prompt it. Simplest entry point for agents."""
+    """One-shot: create a session and prompt it. Default to max effort (explicit strong
+    model + max variant) unless the user specifies effort."""
     await STATE.ensure()
     session = await STATE.client.request("POST", "/session", body={"title": title} if title else {})
     sid = session.get("id", "") if isinstance(session, dict) else ""
-    body: dict[str, Any] = {"parts": [{"type": "text", "text": text}]}
-    m = _model_arg(model)
-    if m:
-        body["model"] = m
-    if agent:
-        body["agent"] = agent
+    body = _prompt_body(text, model, agent, variant)
     msg = await STATE.client.request(
         "POST", "/session/{sessionID}/message", path_params={"sessionID": sid}, body=body
     )
