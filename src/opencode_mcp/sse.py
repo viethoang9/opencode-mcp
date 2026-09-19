@@ -14,8 +14,6 @@ import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-import httpx
-
 from .client import OpencodeClient
 from .journal import Journal
 
@@ -58,6 +56,14 @@ def _session_of(payload: Any) -> str:
                 sid = str(info["id"])
                 if sid.startswith("ses"):
                     return sid
+        sync = payload.get("syncEvent")
+        if isinstance(sync, dict):
+            aggregate = sync.get("aggregateID")
+            if isinstance(aggregate, str) and aggregate.startswith("ses"):
+                return aggregate
+            data = sync.get("data")
+            if isinstance(data, dict) and data.get("sessionID"):
+                return str(data["sessionID"])
     return ""
 
 
@@ -65,6 +71,9 @@ def _etype_of(payload: Any) -> str:
     """Extract event type for journal indexing; 'message' when the frame has none."""
     payload = _unwrap(payload)
     if isinstance(payload, dict):
+        sync = payload.get("syncEvent")
+        if isinstance(sync, dict) and isinstance(sync.get("type"), str) and sync["type"]:
+            return str(sync["type"])[:120]
         t = payload.get("type") or payload.get("event") or ""
         if isinstance(t, str) and t:
             return t[:120]
@@ -118,16 +127,16 @@ async def _consume_stream(
                         if on_event is not None:
                             try:
                                 await on_event({"type": etype, "session_id": sid})
-                            except Exception:  # noqa: BLE001 - notification hint must not kill consumer
-                                pass
+                            except Exception as e:  # noqa: BLE001 - hint must not kill consumer
+                                log.debug("on_event hook failed: %s", e)
         except Exception as e:  # noqa: BLE001 - reconnect loop
             if stop.is_set():
                 break
             log.warning("sse %s error (%s); reconnect in %.1fs", path, str(e)[:200], backoff)
             try:
                 await journal.append("", "mcp.sse.reconnect", {"path": path, "error": str(e)[:300]}, "mcp")
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as marker_error:  # noqa: BLE001 - reconnect must proceed
+                log.debug("could not journal reconnect marker: %s", marker_error)
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 30.0)
 

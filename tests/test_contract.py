@@ -12,10 +12,10 @@ import pytest
 
 pytestmark = pytest.mark.integration
 
-from opencode_mcp.client import OpencodeClient  # noqa: E402
-from opencode_mcp.config import Config  # noqa: E402
-from opencode_mcp.journal import Journal  # noqa: E402
-from opencode_mcp.spec import build_catalog  # noqa: E402
+from opencode_mcp.client import OpencodeClient
+from opencode_mcp.config import Config
+from opencode_mcp.journal import Journal
+from opencode_mcp.spec import build_catalog
 
 
 @pytest.mark.asyncio

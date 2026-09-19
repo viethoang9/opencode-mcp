@@ -9,8 +9,8 @@ via one generic `opencode_api` + `opencode_spec_search` (progressive discovery).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
-import sys
 from typing import Any
 
 from fastmcp import FastMCP
@@ -25,6 +25,9 @@ from .sse import run_consumer
 log = logging.getLogger("opencode-mcp")
 
 mcp = FastMCP(name="opencode-mcp")
+
+MAX_FILE_PAGE_CHARS = 50_000
+MAX_MODELS_PER_PROVIDER = 40
 
 
 class State:
@@ -77,24 +80,44 @@ def _trim(text: Any, limit: int) -> str:
     return s if len(s) <= limit else s[:limit] + f"\n…[truncated {len(s) - limit} chars]"
 
 
+def _cap_obj(obj: Any, limit: int) -> Any:
+    """Bound a structured result so one huge response cannot flood the agent's context."""
+    try:
+        raw = json.dumps(obj)
+    except (TypeError, ValueError):
+        return {"result": _trim(obj, limit)}
+    if len(raw) <= limit:
+        return obj
+    return {"_truncated": True, "_chars": len(raw), "_preview": raw[:limit]}
+
+
 def _parts_text(parts: Any, limit: int) -> str:
-    """Flatten message parts to readable text: text verbatim, tools/files as [tag] lines."""
+    """Flatten message parts to readable text: text verbatim, tools/files as [tag] lines.
+
+    When the flattened form overflows the budget the assistant's text parts win, so a
+    long reasoning block can never truncate away the actual reply.
+    """
     if not isinstance(parts, list):
         return _trim(parts, limit)
     chunks: list[str] = []
+    reply: list[str] = []
     for p in parts:
         if not isinstance(p, dict):
             continue
         t = p.get("type", "")
         if t == "text" and p.get("text"):
             chunks.append(str(p["text"]))
+            reply.append(str(p["text"]))
         elif t in ("tool", "tool-result", "step", "reasoning") and p.get("text"):
             chunks.append(f"[{t}] {p['text']}")
         elif t == "file" and (p.get("path") or p.get("url")):
             chunks.append(f"[file] {p.get('path') or p.get('url')}")
         elif t:
             chunks.append(f"[{t}]")
-    return _trim("\n".join(chunks), limit)
+    joined = "\n".join(chunks)
+    if len(joined) > limit and reply:
+        return _trim("\n".join(reply), limit)
+    return _trim(joined, limit)
 
 
 def _compact_message(msg: Any, max_chars: int) -> dict[str, Any]:
@@ -118,10 +141,12 @@ def _model_arg(model: str | None) -> dict[str, str] | None:
     """Split 'provider/model' into opencode's {providerID, modelID} body shape (None if unset)."""
     if not model:
         return None
-    if "/" in model:
-        provider, _, mid = model.partition("/")
-        return {"providerID": provider, "modelID": mid}
-    return None
+    provider, sep, mid = model.partition("/")
+    if not sep or not provider or not mid:
+        raise ValueError(
+            f"model must be 'provider/model' (e.g. 'zai-coding-plan/glm-5.3'), got {model!r}"
+        )
+    return {"providerID": provider, "modelID": mid}
 
 
 def _prompt_body(
@@ -198,7 +223,8 @@ async def opencode_session_status(session_id: str | None = None) -> dict[str, An
     await STATE.ensure()
     statuses = await STATE.client.request("GET", "/session/status")
     if session_id and isinstance(statuses, dict):
-        return {"session_id": session_id, "status": statuses.get(session_id, {"type": "unknown"})}
+        # opencode only reports sessions that are doing something; absence means idle.
+        return {"session_id": session_id, "status": statuses.get(session_id, {"type": "idle"})}
     return statuses if isinstance(statuses, dict) else {"status": statuses}
 
 
@@ -367,9 +393,12 @@ async def opencode_permission_reply(request_id: str, response: str) -> dict[str,
 
 # -- files ---------------------------------------------------------------------
 @mcp.tool()
-async def opencode_read_file(path: str, offset: int = 0, limit: int = 200) -> dict[str, Any]:
-    """Read a file from the project (paginated; refuses >50KB without full flag)."""
+async def opencode_read_file(
+    path: str, offset: int = 0, limit: int = 200, full: bool = False
+) -> dict[str, Any]:
+    """Read a file from the project (paginated; page capped at 50KB unless full=true)."""
     await STATE.ensure()
+    STATE.config.assert_path_allowed(path)
     data = await STATE.client.request("GET", "/file/content", query={"path": path})
     content = ""
     if isinstance(data, dict):
@@ -378,7 +407,19 @@ async def opencode_read_file(path: str, offset: int = 0, limit: int = 200) -> di
         content = str(data)
     lines = content.splitlines()
     page = lines[offset : offset + max(1, min(limit, 500))]
-    return {"path": path, "total_lines": len(lines), "offset": offset, "lines": page}
+    truncated = False
+    if not full:
+        text = "\n".join(page)
+        if len(text) > MAX_FILE_PAGE_CHARS:
+            page = text[:MAX_FILE_PAGE_CHARS].splitlines()
+            truncated = True
+    return {
+        "path": path,
+        "total_lines": len(lines),
+        "offset": offset,
+        "lines": page,
+        "truncated": truncated,
+    }
 
 
 @mcp.tool()
@@ -410,12 +451,33 @@ async def opencode_agents() -> list[Any]:
 
 @mcp.tool()
 async def opencode_models() -> dict[str, Any]:
-    """List configured providers and default models."""
+    """List configured providers and their model ids (full detail via opencode_api)."""
     await STATE.ensure()
     try:
-        return await STATE.client.request("GET", "/config/providers")
+        data = await STATE.client.request("GET", "/config/providers")
     except OpencodeError:
-        return await STATE.client.request("GET", "/provider")
+        data = await STATE.client.request("GET", "/provider")
+    providers = data.get("providers") if isinstance(data, dict) else None
+    if not isinstance(providers, list):
+        return _cap_obj(data, STATE.config.max_chars)
+    defaults = data.get("default") if isinstance(data.get("default"), dict) else {}
+    out = []
+    for p in providers:
+        if not isinstance(p, dict):
+            continue
+        models = p.get("models")
+        ids = sorted(models) if isinstance(models, dict) else []
+        entry: dict[str, Any] = {
+            "id": p.get("id"),
+            "name": p.get("name"),
+            "default": defaults.get(p.get("id")),
+            "model_count": len(ids),
+            "models": ids[:MAX_MODELS_PER_PROVIDER],
+        }
+        if len(ids) > MAX_MODELS_PER_PROVIDER:
+            entry["models_omitted"] = len(ids) - MAX_MODELS_PER_PROVIDER
+        out.append(entry)
+    return _cap_obj({"providers": out}, STATE.config.max_chars)
 
 
 @mcp.tool()
@@ -465,7 +527,7 @@ async def opencode_api(
             return {"result": res[:50], "truncated": len(res) - 50}
         return {"result": res}
     if isinstance(res, dict):
-        return res
+        return _cap_obj(res, STATE.config.max_chars)
     return {"result": res}
 
 
@@ -474,26 +536,22 @@ async def opencode_api(
 async def resource_health() -> str:
     """Resource view of backend health (same data as opencode_health, for subscribers)."""
     await STATE.ensure()
-    import json as _json
-
-    return _json.dumps(await STATE.client.health())
+    return json.dumps(await STATE.client.health())
 
 
 @mcp.resource("opencode://sessions/{session_id}/events")
 async def resource_session_events(session_id: str) -> str:
     """Latest journaled events for a session (clients: poll events_list for lossless tail)."""
-    import json as _json
-
     await STATE.ensure()
-    data = await STATE.journal.list(after_seq=0, limit=STATE.config.events_default_limit, session_id=session_id)
-    return _json.dumps(data)
+    data = await STATE.journal.tail(
+        limit=STATE.config.events_default_limit, session_id=session_id
+    )
+    return json.dumps(data)
 
 
 @mcp.resource("opencode://sessions/{session_id}/messages")
 async def resource_session_messages(session_id: str) -> str:
     """Resource view of a session's recent messages (compact form, errors inline)."""
-    import json as _json
-
     await STATE.ensure()
     try:
         msgs = await STATE.client.request(
@@ -501,9 +559,9 @@ async def resource_session_messages(session_id: str) -> str:
             path_params={"sessionID": session_id}, query={"limit": 20},
         )
         compact = [_compact_message(m, 2000) for m in msgs] if isinstance(msgs, list) else msgs
-        return _json.dumps({"session_id": session_id, "messages": compact})
+        return json.dumps({"session_id": session_id, "messages": compact})
     except OpencodeError as e:
-        return _json.dumps({"session_id": session_id, "error": str(e)[:500]})
+        return json.dumps({"session_id": session_id, "error": str(e)[:500]})
 
 
 def main() -> None:
@@ -520,8 +578,8 @@ def main() -> None:
                 await STATE.shutdown()
 
             anyio.run(_down)
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as e:  # noqa: BLE001 - exit path must not raise
+            log.debug("shutdown cleanup failed: %s", e)
 
 
 if __name__ == "__main__":

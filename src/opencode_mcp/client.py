@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import time
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 from packaging.version import Version
@@ -65,7 +66,7 @@ class OpencodeClient:
                 self.config.host,
             ]
             log.warning("spawning: %s (cwd=%s)", " ".join(cmd), self.config.directory)
-            self.proc = subprocess.Popen(
+            self.proc = subprocess.Popen(  # noqa: ASYNC220 - returns at once; readiness awaited below
                 cmd,
                 cwd=self.config.directory,
                 env=env,
@@ -82,9 +83,13 @@ class OpencodeClient:
                 auth=auth,
                 timeout=self.config.request_timeout_s,
             )
-            await self._wait_ready_locked()
-            await self._fetch_version_locked()
-            await self._fetch_spec_locked()
+            try:
+                await self._wait_ready_locked()
+                await self._fetch_version_locked()
+                await self._fetch_spec_locked()
+            except BaseException:
+                await self.close()
+                raise
 
     async def _wait_ready_locked(self) -> None:
         """Poll /global/health until 200 or timeout; fail fast if the process dies."""
@@ -119,8 +124,8 @@ class OpencodeClient:
                     "some tools may fail; please upgrade opencode."
                 )
                 log.warning(self.compat_warning)
-        except Exception:  # noqa: BLE001 - non-PEP440 dev versions
-            pass
+        except Exception as e:  # noqa: BLE001 - non-PEP440 dev versions
+            log.debug("version compare skipped for %r: %s", self.version, e)
 
     async def _fetch_spec_locked(self) -> None:
         """Download live OpenAPI from /doc; degrades gracefully (generic tool only)."""
@@ -146,8 +151,8 @@ class OpencodeClient:
         if self._client is not None:
             try:
                 await self._client.aclose()
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as e:  # noqa: BLE001 - shutdown must not raise
+                log.debug("http pool close failed: %s", e)
             self._client = None
         if self.proc is not None:
             try:
@@ -156,17 +161,20 @@ class OpencodeClient:
                     self.proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     self.proc.kill()
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as e:  # noqa: BLE001 - shutdown must not raise
+                log.debug("serve termination failed: %s", e)
             self.proc = None
 
     # -- low-level request ----------------------------------------------
     @staticmethod
     def _substitute(path: str, params: dict[str, Any] | None) -> str:
-        """Fill OpenAPI path templates: /session/{sessionID} + {sessionID: ses_x}."""
+        """Fill OpenAPI path templates: /session/{sessionID} + {sessionID: ses_x}.
+
+        Values are percent-encoded so an id can never escape its path segment.
+        """
         if params:
             for k, v in params.items():
-                path = path.replace("{" + k + "}", str(v))
+                path = path.replace("{" + k + "}", quote(str(v), safe=""))
         return path
 
     async def request(
@@ -184,7 +192,10 @@ class OpencodeClient:
         assert self._client is not None
         url = self._substitute(path, path_params)
         q = {k: v for k, v in (query or {}).items() if v is not None}
-        r = await self._client.request(method, url, params=q or None, json=body)
+        try:
+            r = await self._client.request(method, url, params=q or None, json=body)
+        except httpx.HTTPError as e:
+            raise OpencodeError(f"{method} {url} -> transport error: {e}") from e
         if r.status_code == 204:
             return True
         if r.status_code >= 400:

@@ -58,12 +58,20 @@ class Config:
         """HTTP root of the managed `opencode serve` (e.g. http://127.0.0.1:4096)."""
         return f"http://{self.host}:{self.port}"
 
-    def assert_dir_allowed(self, directory: str | None) -> str:
-        """Resolve working directory, enforcing allowlist (prevents dir-escape)."""
-        d = directory or self.directory
-        d = os.path.realpath(d)
+    def _contain(self, target: str, label: str) -> str:
+        """Return realpath of target if it sits inside an allowed dir, else raise."""
+        resolved = os.path.realpath(target)
         for allowed in self.allowed_dirs:
             a = os.path.realpath(allowed)
-            if d == a or d.startswith(a.rstrip("/") + "/"):
-                return d
-        raise ValueError(f"directory not allowed: {d} (allowed: {self.allowed_dirs})")
+            if resolved == a or resolved.startswith(a.rstrip("/") + "/"):
+                return resolved
+        raise ValueError(f"{label} not allowed: {resolved} (allowed: {self.allowed_dirs})")
+
+    def assert_dir_allowed(self, directory: str | None) -> str:
+        """Resolve working directory, enforcing allowlist (prevents dir-escape)."""
+        return self._contain(directory or self.directory, "directory")
+
+    def assert_path_allowed(self, path: str) -> str:
+        """Resolve a file path (relative to the project root), enforcing the allowlist."""
+        target = path if os.path.isabs(path) else os.path.join(self.directory, path)
+        return self._contain(target, "path")

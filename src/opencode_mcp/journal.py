@@ -15,6 +15,31 @@ import sqlite3
 import time
 from typing import Any
 
+MAX_PAYLOAD_CHARS = 200_000
+MAX_MISSING_REPORTED = 100
+
+
+def _row(r: tuple) -> dict[str, Any]:
+    """Map a DB row to the event dict clients consume."""
+    return {
+        "seq": r[0],
+        "session_id": r[1],
+        "type": r[2],
+        "source": r[3],
+        "payload": json.loads(r[4]) if r[4] else {},
+        "ts": r[5],
+    }
+
+
+def _encode(payload: dict[str, Any]) -> str:
+    """Serialize a payload, replacing (never slicing) oversized JSON so reads stay valid."""
+    raw = json.dumps(payload)
+    if len(raw) <= MAX_PAYLOAD_CHARS:
+        return raw
+    return json.dumps(
+        {"_truncated": True, "_original_chars": len(raw), "_head": raw[:2000]}
+    )
+
 
 class Journal:
     """Durable event store: the source of truth clients resume from after any disconnect.
@@ -52,7 +77,7 @@ class Journal:
         try:
             cur = con.execute(
                 "INSERT INTO events(session_id,type,source,payload,ts) VALUES(?,?,?,?,?)",
-                (session_id or "", etype or "", source or "", json.dumps(payload)[:200000], time.time()),
+                (session_id or "", etype or "", source or "", _encode(payload), time.time()),
             )
             con.commit()
             return int(cur.lastrowid or 0)
@@ -62,7 +87,7 @@ class Journal:
     def _list_sync(
         self, after_seq: int, limit: int, session_id: str | None
     ) -> tuple[list[dict[str, Any]], int]:
-        """Fetch one page (optionally per-session) plus global max seq for has_more."""
+        """Fetch one page plus the max seq of the same scope, so has_more can terminate."""
         con = self._connect()
         try:
             if session_id:
@@ -71,25 +96,54 @@ class Journal:
                     " WHERE seq>? AND session_id=? ORDER BY seq ASC LIMIT?",
                     (after_seq, session_id, limit),
                 ).fetchall()
+                max_seq = con.execute(
+                    "SELECT COALESCE(MAX(seq),0) FROM events WHERE session_id=?", (session_id,)
+                ).fetchone()[0]
             else:
                 rows = con.execute(
                     "SELECT seq,session_id,type,source,payload,ts FROM events"
                     " WHERE seq>? ORDER BY seq ASC LIMIT?",
                     (after_seq, limit),
                 ).fetchall()
-            max_seq = con.execute("SELECT COALESCE(MAX(seq),0) FROM events").fetchone()[0]
-            out = [
-                {
-                    "seq": r[0],
-                    "session_id": r[1],
-                    "type": r[2],
-                    "source": r[3],
-                    "payload": json.loads(r[4]) if r[4] else {},
-                    "ts": r[5],
-                }
-                for r in rows
-            ]
-            return out, int(max_seq)
+                max_seq = con.execute("SELECT COALESCE(MAX(seq),0) FROM events").fetchone()[0]
+            return [_row(r) for r in rows], int(max_seq)
+        finally:
+            con.close()
+
+    def _tail_sync(
+        self, limit: int, session_id: str | None
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Fetch the newest rows of a scope, returned oldest-first within the page."""
+        con = self._connect()
+        try:
+            if session_id:
+                rows = con.execute(
+                    "SELECT seq,session_id,type,source,payload,ts FROM events"
+                    " WHERE session_id=? ORDER BY seq DESC LIMIT?",
+                    (session_id, limit),
+                ).fetchall()
+                max_seq = con.execute(
+                    "SELECT COALESCE(MAX(seq),0) FROM events WHERE session_id=?", (session_id,)
+                ).fetchone()[0]
+            else:
+                rows = con.execute(
+                    "SELECT seq,session_id,type,source,payload,ts FROM events"
+                    " ORDER BY seq DESC LIMIT?",
+                    (limit,),
+                ).fetchall()
+                max_seq = con.execute("SELECT COALESCE(MAX(seq),0) FROM events").fetchone()[0]
+            return [_row(r) for r in reversed(rows)], int(max_seq)
+        finally:
+            con.close()
+
+    def _seqs_sync(self, from_seq: int, to_seq: int) -> set[int]:
+        """Every seq present in [from_seq, to_seq]; unpaged so verify() sees the whole range."""
+        con = self._connect()
+        try:
+            rows = con.execute(
+                "SELECT seq FROM events WHERE seq>=? AND seq<=?", (from_seq, to_seq)
+            ).fetchall()
+            return {int(r[0]) for r in rows}
         finally:
             con.close()
 
@@ -115,10 +169,26 @@ class Journal:
             "has_more": next_seq < max_seq,
         }
 
+    async def tail(self, limit: int = 50, session_id: str | None = None) -> dict[str, Any]:
+        """Newest page for 'latest events' views (events stay oldest-first within the page)."""
+        limit = max(1, min(limit, 200))
+        events, max_seq = await asyncio.to_thread(self._tail_sync, limit, session_id)
+        return {
+            "events": events,
+            "next_seq": events[-1]["seq"] if events else 0,
+            "max_seq": max_seq,
+            "has_more": False,
+        }
+
     async def verify(self, from_seq: int, to_seq: int) -> dict[str, Any]:
         """Assert no gaps in [from_seq, to_seq]; proves lossless resume."""
-        data = await self.list(after_seq=from_seq - 1, limit=(to_seq - from_seq + 1) + 5)
-        seqs = [e["seq"] for e in data["events"] if e["seq"] <= to_seq]
-        expected = list(range(from_seq, to_seq + 1))
-        missing = [s for s in expected if s not in seqs]
-        return {"ok": not missing, "missing": missing, "have": len(seqs), "expected": len(expected)}
+        present = await asyncio.to_thread(self._seqs_sync, from_seq, to_seq)
+        expected = max(0, to_seq - from_seq + 1)
+        missing = [s for s in range(from_seq, to_seq + 1) if s not in present]
+        return {
+            "ok": not missing,
+            "missing": missing[:MAX_MISSING_REPORTED],
+            "missing_count": len(missing),
+            "have": len(present),
+            "expected": expected,
+        }

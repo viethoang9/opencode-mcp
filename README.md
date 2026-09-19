@@ -4,7 +4,7 @@ MCP server (stdio) letting **other agents use [opencode](https://github.com/anom
 
 - **Managed backend:** spawns its own `opencode serve` on a free port, waits for `/global/health`, shuts it down on exit. No pre-running server needed.
 - **Full API coverage, lean context:** 23 curated tools (**~1.9K tokens, LEAN** — less than filesystem's 2.4K, far below GitHub's 11K / Notion's 17K) + generic `opencode_api` / `opencode_spec_search` driven by the **live `/doc` OpenAPI spec**, so opencode updates surface automatically.
-- **Lossless events:** persistent SSE (`/event` + `/global/event`) → SQLite journal with cursor resume. `opencode_events_list` is truth; notifications are hints only. `opencode_events_verify` proves zero gaps.
+- **Lossless events:** persistent SSE (`/event` + `/global/event`) → SQLite journal with cursor resume. `opencode_events_list` is truth; notifications are hints only. `opencode_events_verify` proves the journal has no missing seq in a range (it cannot see events dropped while SSE was disconnected — those are flagged by `mcp.sse.reconnect` markers).
 
 ## Install
 
@@ -58,8 +58,11 @@ effort, forwarded verbatim). Advise agents via repo rules (`AGENTS.md`):
 | Var | Default | Purpose |
 |---|---|---|
 | `OPENCODE_BINARY` | `opencode` | binary path |
+| `OPENCODE_HOST` | `127.0.0.1` | bind address for the managed serve |
 | `OPENCODE_PORT` | `0` (auto) | fixed port if needed |
-| `OPENCODE_SERVER_PASSWORD` | — | basic-auth passthrough |
+| `OPENCODE_SERVER_USERNAME` / `OPENCODE_SERVER_PASSWORD` | `opencode` / — | basic-auth passthrough |
+| `OPENCODE_START_TIMEOUT` | `30` | seconds to wait for serve readiness |
+| `OPENCODE_REQUEST_TIMEOUT` | `120` | per-request timeout; raise for long max-effort prompts |
 | `OPENCODE_DIRECTORY` / `OPENCODE_ALLOWED_DIRS` | cwd | working dir + allowlist |
 | `OPENCODE_TOOL_GROUPS` | core groups | `all` exposes every spec group in search |
 | `OPENCODE_MAX_CHARS` | `8000` | per-result text cap |
@@ -71,7 +74,7 @@ effort, forwarded verbatim). Advise agents via repo rules (`AGENTS.md`):
 ## Context cost
 
 ```bash
-uv run python scripts/tokens.py   # static defs census, budget 9000 (currently ~1938)
+uv run python scripts/tokens.py   # static defs census, budget 9000 (currently ~2097)
 ```
 
 Design: lean hand-written schemas for the hot path; the 160+ op tail lives behind one 207-token `opencode_api` tool (progressive discovery). Full transcripts/file contents are paginated and truncated by default.
@@ -86,6 +89,7 @@ Design: lean hand-written schemas for the hot path; the 160+ op tail lives behin
 ## Dev
 
 ```bash
-uv run pytest tests/test_journal.py tests/test_spec.py -q
+uv run pytest -m "not integration" -q
+uv run ruff check src tests
 OPENCODE_TEST=1 uv run pytest tests/test_contract.py -q   # needs opencode binary
 ```
