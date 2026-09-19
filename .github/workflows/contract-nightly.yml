@@ -1,0 +1,23 @@
+name: contract-nightly
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        channel: [latest, dev]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: install opencode ${{ matrix.channel }}
+        run: |
+          if [ "${{ matrix.channel }}" = "dev" ]; then
+            curl -fsSL https://opencode.ai/install | bash -s -- --dev || npm i -g opencode-ai@dev || true
+          else
+            curl -fsSL https://opencode.ai/install | bash || npm i -g opencode-ai@latest || true
+          fi
+      - run: uv sync --extra test
+      - run: OPENCODE_TEST=1 uv run pytest tests/test_contract.py -q

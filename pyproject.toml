@@ -1,0 +1,37 @@
+[project]
+name = "opencode-mcp"
+version = "0.1.0"
+description = "MCP server letting other agents use opencode (managed opencode serve + lossless event journal)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "opencode-mcp" }]
+dependencies = [
+  "fastmcp>=2.0",
+  "httpx>=0.27",
+  "pydantic>=2.0",
+  "packaging>=24.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0", "pytest-asyncio>=0.23", "tiktoken>=0.7"]
+dev = ["ruff>=0.4"]
+
+[project.scripts]
+opencode-mcp = "opencode_mcp.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/opencode_mcp"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = ["integration: live contract tests against real opencode serve (needs OPENCODE_TEST=1)"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
